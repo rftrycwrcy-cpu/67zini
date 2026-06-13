@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>DESVIE — o jogo mais sério do mundo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #05060f;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+    user-select: none;
+  }
+  #gameCanvas {
+    display: block;
+    image-rendering: pixelated;
+    cursor: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// Responsive sizing
+function resize() {
+  const maxW = Math.min(window.innerWidth, 480);
+  const maxH = Math.min(window.innerHeight, 720);
+  const ratio = Math.min(maxW / 480, maxH / 720);
+  canvas.width = 480;
+  canvas.height = 720;
+  canvas.style.width = (480 * ratio) + 'px';
+  canvas.style.height = (720 * ratio) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── COLORS ───────────────────────────────────────────────────────────────────
+const C = {
+  bg:       '#05060f',
+  bgGrid:   '#0a0c1a',
+  player:   '#ffffff',
+  glow:     'rgba(255,255,255,0.15)',
+  balls: ['#b56aff','#ff4d6d','#00d4ff','#ffd166','#ff6b35','#06d6a0'],
+  text:     '#ffffff',
+  textDim:  '#4a5070',
+  phase:    '#2a2d4a',
+  phaseBar: '#5f6fff',
+  ui:       '#7b7f9e',
+};
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let state = 'menu'; // menu | lore | playing | paused | dead | win | credits
+let gameMode = 'campaign'; // campaign | infinite
+
+const PHASES = [
+  { label: '1', balls: 2, speed: 2.0, spawnRate: 120, lore: '"Começou como uma garoa."' },
+  { label: '2', balls: 3, speed: 2.5, spawnRate: 100, lore: '"Depois foram pedras."' },
+  { label: '3', balls: 4, speed: 3.0, spawnRate: 85,  lore: '"Eu nem sei o que caiu aqui."' },
+  { label: '4', balls: 5, speed: 3.6, spawnRate: 70,  lore: '"Alguém apagou o sol, acho."' },
+  { label: '5', balls: 6, speed: 4.2, spawnRate: 58,  lore: '"Sério, o que é isso?!"' },
+  { label: '6', balls: 7, speed: 5.0, spawnRate: 45,  lore: '"Ok, vou desligar o computador."' },
+  { label: 'BOSS', balls: 0, speed: 0, spawnRate: 0,  lore: '"…o quadrado olhou para cima."' },
+];
+const PHASE_DURATION = 55; // seconds per phase (campaign)
+
+const game = {
+  phase: 0,
+  phaseTimer: 0,
+  loreAlpha: 0,
+  loreState: 'in', // in | hold | out
+  loreTick: 0,
+
+  // Player
+  px: 240, py: 660, pw: 18, ph: 18,
+  pvx: 0,
+  glowPulse: 0,
+  dead: false,
+  deathTick: 0,
+
+  // Balls
+  balls: [],
+  spawnTick: 0,
+  particles: [],
+
+  // Infinite
+  infScore: 0,
+  infBestScore: parseInt(localStorage.getItem('desvie_best') || '0'),
+  infLevel: 1,
+  infSpeedMult: 1,
+  infSpawnRate: 130,
+  infTick: 0,
+
+  // Boss
+  boss: null,
+  bossPhase: 1,
+  bossTick: 0,
+  bossHealth: 300,
+  bossAngle: 0,
+  bossPatternTick: 0,
+
+  // Campaign
+  campaignComplete: false,
+  infinitePlusUnlocked: parseInt(localStorage.getItem('desvie_plus') || '0'),
+
+  // UI
+  menuSel: 0,
+  deadTick: 0,
+
+  // Stars bg
+  stars: Array.from({length: 60}, () => ({
+    x: Math.random()*480, y: Math.random()*720,
+    s: Math.random()*1.5+0.5, a: Math.random()
+  })),
+  starTick: 0,
+
+  // Shake
+  shakeTick: 0, shakeAmt: 0,
+};
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Escape') onEsc();
+  if (e.code === 'Space' || e.code === 'Enter') onConfirm();
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Touch controls
+let touchLeft = false, touchRight = false;
+canvas.addEventListener('touchstart', handleTouch, {passive:false});
+canvas.addEventListener('touchmove', handleTouch, {passive:false});
+canvas.addEventListener('touchend', e => { touchLeft = false; touchRight = false; e.preventDefault(); }, {passive:false});
+function handleTouch(e) {
+  e.preventDefault();
+  touchLeft = false; touchRight = false;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  for (let t of e.touches) {
+    const x = (t.clientX - rect.left) * scaleX;
+    if (x < canvas.width / 2) touchLeft = true;
+    else touchRight = true;
+  }
+}
+
+function onEsc() {
+  if (state === 'playing') { state = 'paused'; }
+  else if (state === 'paused') { state = 'playing'; }
+}
+function onConfirm() {
+  if (state === 'menu') {
+    if (game.menuSel === 0) { startGame('campaign'); }
+    else if (game.menuSel === 1) { startGame('infinite'); }
+    else if (game.menuSel === 2 && game.infinitePlusUnlocked) { startGame('infiniteplus'); }
+  } else if (state === 'lore') {
+    game.loreTick = 140; // skip
+  } else if (state === 'paused') {
+    state = 'playing';
+  } else if (state === 'dead') {
+    if (game.deadTick > 60) { resetGame(); state = 'menu'; }
+  } else if (state === 'win') {
+    state = 'credits';
+  } else if (state === 'credits') {
+    state = 'menu';
+  }
+}
+window.addEventListener('keydown', e => {
+  if (state === 'menu') {
+    const maxOpts = game.infinitePlusUnlocked ? 3 : 2;
+    if (e.code === 'ArrowDown' || e.code === 'ArrowRight') game.menuSel = (game.menuSel + 1) % maxOpts;
+    if (e.code === 'ArrowUp'   || e.code === 'ArrowLeft')  game.menuSel = (game.menuSel - 1 + maxOpts) % maxOpts;
+  }
+}, {capture: true});
+
+// ─── GAME FUNCTIONS ───────────────────────────────────────────────────────────
+function startGame(mode) {
+  gameMode = mode;
+  resetGame();
+  if (mode === 'campaign') {
+    game.phase = 0;
+    state = 'lore';
+    game.loreAlpha = 0;
+    game.loreState = 'in';
+    game.loreTick = 0;
+  } else {
+    state = 'playing';
+  }
+}
+
+function resetGame() {
+  game.px = 240; game.py = 660; game.pvx = 0;
+  game.dead = false; game.deathTick = 0; game.deadTick = 0;
+  game.balls = []; game.particles = [];
+  game.spawnTick = 0; game.phaseTimer = 0;
+  game.boss = null; game.bossPhase = 1; game.bossTick = 0; game.bossHealth = 300; game.bossAngle = 0; game.bossPatternTick = 0;
+  game.infScore = 0; game.infLevel = 1; game.infSpeedMult = 1; game.infSpawnRate = 130; game.infTick = 0;
+  game.shakeTick = 0; game.shakeAmt = 0;
+  game.campaignComplete = false;
+}
+
+function getPhaseConfig() {
+  if (gameMode === 'infinite' || gameMode === 'infiniteplus') {
+    return {
+      speed: 2.2 * game.infSpeedMult,
+      spawnRate: game.infSpawnRate,
+      balls: Math.min(8, 2 + game.infLevel),
+    };
+  }
+  return PHASES[game.phase] || PHASES[PHASES.length - 1];
+}
+
+function spawnBall() {
+  const cfg = getPhaseConfig();
+  const x = 20 + Math.random() * 440;
+  const r = 6 + Math.floor(Math.random() * 5);
+  const colorIdx = Math.floor(Math.random() * C.balls.length);
+  const vx = (Math.random() - 0.5) * 1.2;
+  const vy = cfg.speed * (0.85 + Math.random() * 0.3);
+  game.balls.push({ x, y: -r, r, vx, vy, color: C.balls[colorIdx], trail: [], split: false });
+}
+
+function spawnParticles(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 3;
+    game.particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 1,
+      life: 1, maxLife: 30 + Math.random() * 20,
+      size: 2 + Math.random() * 3,
+      color,
+      square: Math.random() > 0.5,
+    });
+  }
+}
+
+function startBoss() {
+  game.boss = {
+    x: 240, y: 140,
+    targetX: 240, targetY: 140,
+    r: 55,
+    eye: { pulse: 0 },
+    orbs: Array.from({length: 8}, (_, i) => ({
+      angle: (i / 8) * Math.PI * 2,
+      dist: 80,
+      color: C.balls[i % C.balls.length],
+      r: 8,
+    })),
+    ring: 0,
+  };
+  game.bossHealth = 300;
+  game.bossPhase = 1;
+  game.bossTick = 0;
+  game.bossPatternTick = 0;
+}
+
+// ─── UPDATE ───────────────────────────────────────────────────────────────────
+function update() {
+  game.starTick++;
+  game.glowPulse = (game.glowPulse + 0.04) % (Math.PI * 2);
+
+  if (state === 'lore') { updateLore(); return; }
+  if (state !== 'playing') { return; }
+
+  // Player movement
+  const acc = 1.1, friction = 0.78, maxSpeed = 5.5;
+  let moving = false;
+  if ((keys['ArrowLeft'] || keys['KeyA'] || touchLeft) && !game.dead) {
+    game.pvx -= acc; moving = true;
+  }
+  if ((keys['ArrowRight'] || keys['KeyD'] || touchRight) && !game.dead) {
+    game.pvx += acc; moving = true;
+  }
+  game.pvx *= friction;
+  if (Math.abs(game.pvx) > maxSpeed) game.pvx = Math.sign(game.pvx) * maxSpeed;
+  if (!game.dead) {
+    game.px += game.pvx;
+    game.px = Math.max(game.pw / 2 + 5, Math.min(480 - game.pw / 2 - 5, game.px));
+  }
+
+  if (game.dead) {
+    game.deathTick++;
+    game.deadTick++;
+    return;
+  }
+
+  // Shake
+  if (game.shakeTick > 0) game.shakeTick--;
+
+  // ── Campaign phase logic
+  if (gameMode === 'campaign') {
+    if (game.phase < PHASES.length - 1) {
+      game.phaseTimer += 1/60;
+      if (game.phaseTimer >= PHASE_DURATION) {
+        game.phase++;
+        game.phaseTimer = 0;
+        game.balls = [];
+        if (game.phase === PHASES.length - 1) {
+          startBoss();
+        }
+        state = 'lore';
+        game.loreAlpha = 0;
+        game.loreState = 'in';
+        game.loreTick = 0;
+        return;
+      }
+    } else {
+      // Boss fight
+      updateBoss();
+    }
+  }
+
+  // ── Infinite logic
+  if (gameMode === 'infinite' || gameMode === 'infiniteplus') {
+    game.infScore += 1/60;
+    game.infTick++;
+    if (game.infTick % 1200 === 0) {
+      game.infLevel++;
+      game.infSpeedMult += 0.18;
+      game.infSpawnRate = Math.max(28, game.infSpawnRate - 10);
+    }
+    // Infinite+ boss attacks mixed in
+    if (gameMode === 'infiniteplus' && game.infScore > 30) {
+      if (Math.random() < 0.003) spawnBossMiniBurst();
+    }
+  }
+
+  // ── Spawn balls
+  if (gameMode !== 'campaign' || game.phase < PHASES.length - 1) {
+    const cfg = getPhaseConfig();
+    game.spawnTick++;
+    if (game.spawnTick >= cfg.spawnRate) {
+      spawnBall();
+      game.spawnTick = 0;
+    }
+  }
+
+  // ── Update balls
+  for (let i = game.balls.length - 1; i >= 0; i--) {
+    const b = game.balls[i];
+    b.trail.push({x: b.x, y: b.y});
+    if (b.trail.length > 5) b.trail.shift();
+    b.x += b.vx;
+    b.y += b.vy;
+
+    // Wall bounce
+    if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx); }
+    if (b.x > 480 - b.r) { b.x = 480 - b.r; b.vx = -Math.abs(b.vx); }
+
+    // Hit ground
+    if (b.y > 720 + b.r) {
+      spawnParticles(b.x, 710, b.color, 6);
+      // Split mechanic in phase 4+
+      if (gameMode === 'campaign' && game.phase >= 4 && !b.split && b.r > 5) {
+        for (let s = 0; s < 2; s++) {
+          game.balls.push({
+            x: b.x + (s === 0 ? -8 : 8),
+            y: 715,
+            r: Math.max(4, b.r - 3),
+            vx: (s === 0 ? -1.5 : 1.5),
+            vy: -3.5,
+            color: b.color,
+            trail: [],
+            split: true,
+          });
+        }
+      }
+      game.balls.splice(i, 1);
+      continue;
+    }
+
+    // Collision with player
+    const dx = b.x - game.px;
+    const dy = b.y - (game.py + game.ph / 2);
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const hitRadius = b.r + game.pw * 0.6;
+    if (dist < hitRadius) {
+      killPlayer(b.color);
+    }
+  }
+
+  // ── Update particles
+  for (let i = game.particles.length - 1; i >= 0; i--) {
+    const p = game.particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.12;
+    p.life -= 1 / p.maxLife;
+    if (p.life <= 0) game.particles.splice(i, 1);
+  }
+}
+
+function killPlayer(color) {
+  game.dead = true;
+  spawnParticles(game.px, game.py + game.ph/2, '#ffffff', 20);
+  spawnParticles(game.px, game.py + game.ph/2, color, 15);
+  game.shakeTick = 20; game.shakeAmt = 8;
+
+  if (gameMode === 'infinite' || gameMode === 'infiniteplus') {
+    if (Math.floor(game.infScore) > game.infBestScore) {
+      game.infBestScore = Math.floor(game.infScore);
+      localStorage.setItem('desvie_best', game.infBestScore);
+    }
+  }
+
+  // Show dead screen after delay
+  setTimeout(() => { if (game.dead) state = 'dead'; }, 1200);
+}
+
+function spawnBossMiniBurst() {
+  const angles = [0, Math.PI/3, 2*Math.PI/3, Math.PI, 4*Math.PI/3, 5*Math.PI/3];
+  for (const a of angles) {
+    game.balls.push({
+      x: 240 + Math.cos(a) * 30,
+      y: 80,
+      r: 7,
+      vx: Math.cos(a + Math.PI/2) * 2,
+      vy: 4,
+      color: C.balls[2],
+      trail: [],
+      split: false,
+    });
+  }
+}
+
+function updateBoss() {
+  const boss = game.boss;
+  if (!boss) return;
+  game.bossTick++;
+  game.bossPatternTick++;
+  boss.ring = (boss.ring + 0.015) % (Math.PI * 2);
+  boss.eye.pulse = (boss.eye.pulse + 0.05) % (Math.PI * 2);
+
+  // Boss oscillation
+  boss.x = 240 + Math.sin(game.bossTick * 0.012) * 80;
+  boss.y = 130 + Math.sin(game.bossTick * 0.008) * 20;
+
+  // Orbs
+  for (let o of boss.orbs) {
+    o.angle += 0.025 * (game.bossPhase === 3 ? 2 : 1);
+  }
+
+  // Boss health → phases
+  const hp = game.bossHealth;
+  if (hp <= 0) {
+    bossWin();
+    return;
+  }
+  if (hp < 100 && game.bossPhase < 3) {
+    game.bossPhase = 3;
+    game.shakeTick = 40; game.shakeAmt = 6;
+  } else if (hp < 200 && game.bossPhase < 2) {
+    game.bossPhase = 2;
+    game.shakeTick = 20; game.shakeAmt = 4;
+  }
+
+  // Boss drains health over time → surviving defeats boss
+  game.bossHealth -= 0.2 + (game.bossPhase - 1) * 0.1;
+
+  // Attack patterns
+  const patternInterval = game.bossPhase === 1 ? 90 : game.bossPhase === 2 ? 60 : 40;
+  if (game.bossPatternTick % patternInterval === 0) {
+    const pat = Math.floor(Math.random() * (game.bossPhase === 1 ? 2 : game.bossPhase === 2 ? 3 : 4));
+    launchBossPattern(pat, boss);
+  }
+
+  // Phase 3 shaking
+  if (game.bossPhase === 3 && game.bossTick % 30 === 0) {
+    game.shakeTick = 5; game.shakeAmt = 3;
+  }
+}
+
+function launchBossPattern(pat, boss) {
+  const bx = boss.x, by = boss.y;
+  if (pat === 0) {
+    // Straight rain
+    for (let i = 0; i < 4; i++) {
+      setTimeout(() => {
+        game.balls.push({x: 60 + i * 120 + (Math.random()-0.5)*40, y: by + 60, r: 8, vx: 0, vy: 4.5 + game.bossPhase * 0.5, color: C.balls[0], trail: [], split: false});
+      }, i * 80);
+    }
+  } else if (pat === 1) {
+    // Spread
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI/2 + (i - 2) * 0.22;
+      game.balls.push({x: bx, y: by + 60, r: 7, vx: Math.cos(a) * 3.5, vy: Math.sin(a) * 3.5 + 3, color: C.balls[3], trail: [], split: false});
+    }
+  } else if (pat === 2) {
+    // Spiral
+    const count = 6;
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + game.bossAngle;
+      game.balls.push({x: bx + Math.cos(a)*50, y: by + 60, r: 6, vx: Math.cos(a) * 2, vy: 4, color: C.balls[1], trail: [], split: false});
+    }
+    game.bossAngle += 0.5;
+  } else if (pat === 3) {
+    // Chaos - random burst
+    for (let i = 0; i < 8; i++) {
+      game.balls.push({
+        x: bx + (Math.random()-0.5)*100,
+        y: by + 60,
+        r: 5 + Math.random()*5,
+        vx: (Math.random()-0.5)*5,
+        vy: 3.5 + Math.random()*3,
+        color: C.balls[Math.floor(Math.random()*C.balls.length)],
+        trail: [], split: false,
+      });
+    }
+  }
+}
+
+function bossWin() {
+  // Explode boss particles
+  const boss = game.boss;
+  for (let i = 0; i < 80; i++) {
+    spawnParticles(boss.x, boss.y, C.balls[i % C.balls.length], 1);
+  }
+  game.boss = null;
+  game.balls = [];
+  game.campaignComplete = true;
+  if (!game.infinitePlusUnlocked) {
+    game.infinitePlusUnlocked = 1;
+    localStorage.setItem('desvie_plus', '1');
+  }
+  setTimeout(() => { state = 'win'; }, 1500);
+}
+
+function updateLore() {
+  game.loreTick++;
+  const IN = 40, HOLD = 140, OUT = 40, TOTAL = IN + HOLD + OUT;
+  if (game.loreTick <= IN) {
+    game.loreAlpha = game.loreTick / IN;
+  } else if (game.loreTick <= IN + HOLD) {
+    game.loreAlpha = 1;
+  } else if (game.loreTick <= TOTAL) {
+    game.loreAlpha = 1 - (game.loreTick - IN - HOLD) / OUT;
+  } else {
+    game.loreAlpha = 0;
+    state = 'playing';
+  }
+}
+
+// ─── DRAW ─────────────────────────────────────────────────────────────────────
+function draw() {
+  // Shake offset
+  let sx = 0, sy = 0;
+  if (game.shakeTick > 0) {
+    sx = (Math.random()-0.5) * game.shakeAmt;
+    sy = (Math.random()-0.5) * game.shakeAmt;
+  }
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(-10, -10, 500, 740);
+
+  drawStars();
+
+  if (state === 'menu') { drawMenu(); ctx.restore(); return; }
+  if (state === 'lore') { drawLore(); ctx.restore(); return; }
+  if (state === 'credits') { drawCredits(); ctx.restore(); return; }
+  if (state === 'win') { drawWin(); ctx.restore(); return; }
+
+  // Ground line
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, 700); ctx.lineTo(480, 700); ctx.stroke();
+
+  // Particles
+  drawParticles();
+
+  // Balls
+  drawBalls();
+
+  // Player
+  if (!game.dead || game.deathTick < 20) drawPlayer();
+
+  // Boss
+  if (game.boss) drawBoss();
+
+  // UI overlay
+  drawHUD();
+
+  if (state === 'paused') drawPause();
+  if (state === 'dead') drawDead();
+
+  ctx.restore();
+}
+
+function drawStars() {
+  for (const s of game.stars) {
+    const twinkle = 0.3 + 0.4 * Math.sin(game.starTick * 0.02 + s.a * 10);
+    ctx.fillStyle = `rgba(180,190,255,${twinkle})`;
+    ctx.fillRect(s.x | 0, s.y | 0, s.s | 0 || 1, s.s | 0 || 1);
+  }
+}
+
+function drawPlayer() {
+  const x = game.px - game.pw / 2;
+  const y = game.py;
+
+  // Glow layers
+  const glow = 0.5 + 0.5 * Math.sin(game.glowPulse);
+  for (let i = 3; i >= 0; i--) {
+    ctx.fillStyle = `rgba(255,255,255,${(0.03 + glow * 0.04) / (i + 1)})`;
+    ctx.fillRect(x - i * 3, y - i * 3, game.pw + i * 6, game.ph + i * 6);
+  }
+
+  // Player body — pixel perfect 18×18 white square
+  ctx.fillStyle = C.player;
+  ctx.fillRect(x | 0, y | 0, game.pw, game.ph);
+
+  // Tiny eye detail
+  ctx.fillStyle = C.bg;
+  ctx.fillRect((x + 5) | 0, (y + 5) | 0, 3, 3);
+  ctx.fillRect((x + 10) | 0, (y + 5) | 0, 3, 3);
+}
+
+function drawBalls() {
+  for (const b of game.balls) {
+    // Trail
+    for (let i = 0; i < b.trail.length; i++) {
+      const t = b.trail[i];
+      const alpha = (i / b.trail.length) * 0.3;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, b.r * (i / b.trail.length), 0, Math.PI * 2);
+      ctx.fillStyle = b.color + Math.floor(alpha * 255).toString(16).padStart(2, '0');
+      ctx.fill();
+    }
+
+    // Ball body — pixel circles via arc
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.fillStyle = b.color;
+    ctx.fill();
+
+    // Highlight
+    ctx.beginPath();
+    ctx.arc(b.x - b.r * 0.25, b.y - b.r * 0.25, b.r * 0.3, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fill();
+  }
+}
+
+function drawBoss() {
+  const boss = game.boss;
+  const bx = boss.x, by = boss.y;
+
+  // Outer ring
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2 + boss.ring;
+    const rx = bx + Math.cos(a) * 100;
+    const ry = by + Math.sin(a) * 100;
+    const size = 4 + 2 * Math.sin(boss.ring + i);
+    ctx.fillStyle = i % 2 === 0 ? C.balls[0] : C.balls[2];
+    ctx.fillRect(rx - size/2, ry - size/2, size, size);
+  }
+
+  // Orbs
+  for (const o of boss.orbs) {
+    const ox = bx + Math.cos(o.angle) * o.dist;
+    const oy = by + Math.sin(o.angle) * o.dist;
+    ctx.beginPath();
+    ctx.arc(ox, oy, o.r, 0, Math.PI * 2);
+    ctx.fillStyle = o.color;
+    ctx.fill();
+  }
+
+  // Body
+  ctx.beginPath();
+  ctx.arc(bx, by, boss.r, 0, Math.PI * 2);
+  ctx.fillStyle = '#1a0a2e';
+  ctx.fill();
+  ctx.strokeStyle = C.balls[0];
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Geometric inner squares
+  for (let i = 0; i < 4; i++) {
+    const s = boss.r * 0.35 + i * 6;
+    const angle = boss.ring * (1 + i * 0.3);
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(angle);
+    ctx.strokeStyle = `rgba(${i%2===0?'180,80,255':'60,200,255'},${0.4 - i*0.05})`;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-s, -s, s*2, s*2);
+    ctx.restore();
+  }
+
+  // Eye
+  const pupilX = bx + (game.px - bx) * 0.2;
+  const pupilY = by + (game.py - by) * 0.1;
+  const eyePulse = 1 + 0.15 * Math.sin(boss.eye.pulse);
+
+  ctx.beginPath();
+  ctx.arc(bx, by, boss.r * 0.38 * eyePulse, 0, Math.PI * 2);
+  ctx.fillStyle = '#2c0050';
+  ctx.fill();
+
+  // Iris
+  ctx.beginPath();
+  ctx.arc(bx, by, boss.r * 0.22, 0, Math.PI * 2);
+  ctx.fillStyle = '#a020f0';
+  ctx.fill();
+
+  // Pupil (looks at player)
+  ctx.beginPath();
+  ctx.arc(pupilX, pupilY, boss.r * 0.1, 0, Math.PI * 2);
+  ctx.fillStyle = '#05060f';
+  ctx.fill();
+
+  // Glint
+  ctx.beginPath();
+  ctx.arc(bx - boss.r*0.1, by - boss.r*0.12, boss.r * 0.05, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fill();
+
+  // Boss HP bar
+  const hpW = 200;
+  const hpX = (480 - hpW) / 2;
+  const hpY = 18;
+  ctx.fillStyle = '#1a0a2e';
+  ctx.fillRect(hpX, hpY, hpW, 10);
+  const hpFill = Math.max(0, game.bossHealth / 300);
+  const hpColor = hpFill > 0.6 ? C.balls[0] : hpFill > 0.3 ? C.balls[3] : C.balls[1];
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(hpX, hpY, hpW * hpFill, 10);
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(hpX, hpY, hpW, 10);
+  pixelText('CORAÇÃO DA TEMPESTADE', 240, hpY - 4, 9, 'rgba(255,255,255,0.5)', 'center');
+
+  // Boss phase glow
+  if (game.bossPhase === 3) {
+    ctx.fillStyle = `rgba(90,0,160,${0.05 + 0.04*Math.sin(game.bossTick*0.1)})`;
+    ctx.fillRect(0, 0, 480, 720);
+  }
+}
+
+function drawParticles() {
+  for (const p of game.particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    if (p.square) {
+      ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+    } else {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size/2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function pixelText(text, x, y, size, color, align) {
+  ctx.font = `bold ${size}px 'Courier New', monospace`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y);
+}
+
+function drawHUD() {
+  if (gameMode === 'campaign' && game.phase < PHASES.length - 1) {
+    // Phase bar
+    const barW = 200;
+    const barX = (480 - barW) / 2;
+    const barY = 18;
+    ctx.fillStyle = C.phase;
+    ctx.fillRect(barX, barY, barW, 7);
+    const fill = (game.phaseTimer / PHASE_DURATION);
+    ctx.fillStyle = C.phaseBar;
+    ctx.fillRect(barX, barY, barW * fill, 7);
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(barX, barY, barW, 7);
+    pixelText(`FASE ${PHASES[game.phase].label}`, 240, barY - 5, 9, C.ui, 'center');
+  }
+
+  if (gameMode === 'infinite' || gameMode === 'infiniteplus') {
+    pixelText(Math.floor(game.infScore) + 's', 240, 28, 18, 'rgba(255,255,255,0.8)', 'center');
+    pixelText(`LV ${game.infLevel}`, 240, 46, 9, C.ui, 'center');
+    if (gameMode === 'infiniteplus') {
+      pixelText('∞+', 20, 30, 14, C.balls[0], 'left');
+    }
+  }
+
+  // Mobile touch hints (faded)
+  const showHints = ('ontouchstart' in window);
+  if (showHints && !game.dead) {
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(0, 620, 200, 100);
+    ctx.fillRect(280, 620, 200, 100);
+    pixelText('◀', 80, 670, 28, 'rgba(255,255,255,0.08)', 'center');
+    pixelText('▶', 400, 670, 28, 'rgba(255,255,255,0.08)', 'center');
+  }
+}
+
+function drawMenu() {
+  // Title
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  ctx.fillRect(80, 160, 320, 140);
+
+  // Animated sample ball
+  const bx = 240 + Math.sin(game.starTick * 0.04) * 60;
+  const by = 100 + Math.sin(game.starTick * 0.025) * 20;
+  ctx.beginPath();
+  ctx.arc(bx, by, 14, 0, Math.PI * 2);
+  ctx.fillStyle = C.balls[Math.floor(game.starTick / 60) % C.balls.length];
+  ctx.fill();
+
+  pixelText('DESVIE', 240, 195, 36, '#ffffff', 'center');
+  pixelText('o jogo mais sério do mundo', 240, 230, 11, C.ui, 'center');
+
+  // Sample player icon at menu
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(231, 262, 18, 18);
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(236, 267, 3, 3);
+  ctx.fillRect(241, 267, 3, 3);
+
+  const opts = ['CAMPANHA', 'INFINITO'];
+  if (game.infinitePlusUnlocked) opts.push('INFINITO+  ★');
+
+  for (let i = 0; i < opts.length; i++) {
+    const y = 350 + i * 52;
+    const sel = game.menuSel === i;
+    if (sel) {
+      ctx.fillStyle = 'rgba(95,111,255,0.18)';
+      ctx.fillRect(100, y - 16, 280, 34);
+      ctx.fillStyle = C.phaseBar;
+      ctx.fillRect(96, y - 16, 4, 34);
+    }
+    pixelText(opts[i], 240, y + 2, sel ? 15 : 13, sel ? '#ffffff' : C.ui, 'center');
+  }
+
+  pixelText('A/D ou ← → para mover', 240, 530, 10, C.textDim, 'center');
+  pixelText('ENTER ou ESPAÇO para confirmar', 240, 548, 10, C.textDim, 'center');
+
+  if (game.infBestScore > 0) {
+    pixelText(`recorde: ${game.infBestScore}s`, 240, 610, 11, C.textDim, 'center');
+  }
+
+  pixelText('setas ↑↓ para navegar', 240, 580, 10, C.textDim, 'center');
+}
+
+function drawLore() {
+  ctx.globalAlpha = game.loreAlpha;
+  // Faint decorative lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(80, 340); ctx.lineTo(400, 340); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(80, 390); ctx.lineTo(400, 390); ctx.stroke();
+
+  const lore = PHASES[game.phase]?.lore || '"..."';
+  const phaseLabel = game.phase === PHASES.length - 1 ? 'BOSS' : `FASE ${PHASES[game.phase].label}`;
+  pixelText(phaseLabel, 240, 318, 11, C.ui, 'center');
+  pixelText(lore, 240, 365, 14, '#ffffff', 'center');
+
+  // A tiny white square falling slowly
+  const sqY = 410 + game.loreTick * 0.5;
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillRect(233, sqY, 14, 14);
+
+  ctx.globalAlpha = game.loreAlpha * 0.4;
+  pixelText('ESPAÇO para pular', 240, 430 + game.loreTick*0.5 + 30, 9, C.ui, 'center');
+  ctx.globalAlpha = 1;
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(5,6,15,0.82)';
+  ctx.fillRect(0, 0, 480, 720);
+  pixelText('PAUSADO', 240, 340, 20, '#ffffff', 'center');
+  pixelText('ESC ou ESPAÇO para continuar', 240, 370, 11, C.ui, 'center');
+}
+
+function drawDead() {
+  if (game.deadTick < 30) return;
+  const alpha = Math.min(1, (game.deadTick - 30) / 40);
+  ctx.fillStyle = `rgba(5,6,15,${alpha * 0.88})`;
+  ctx.fillRect(0, 0, 480, 720);
+  if (alpha < 0.5) return;
+
+  pixelText('VOCÊ MORREU', 240, 300, 22, '#ff4d6d', 'center');
+
+  const msgs = [
+    'que tragédia.',
+    'mas foi bonito.',
+    'tenta de novo.',
+    'quase.',
+    'isso não devia acontecer.',
+    'o quadrado descansou.',
+  ];
+  const msg = msgs[Math.floor(Math.random() * msgs.length)];
+
+  if (game.deadTick > 60) {
+    pixelText(msg, 240, 340, 12, C.ui, 'center');
+    if (gameMode === 'infinite' || gameMode === 'infiniteplus') {
+      pixelText(`${Math.floor(game.infScore)}s sobrevivido`, 240, 378, 14, '#ffffff', 'center');
+      if (Math.floor(game.infScore) >= game.infBestScore) {
+        pixelText('novo recorde!', 240, 400, 11, C.balls[3], 'center');
+      } else {
+        pixelText(`recorde: ${game.infBestScore}s`, 240, 400, 11, C.textDim, 'center');
+      }
+    }
+  }
+
+  if (game.deadTick > 90) {
+    const blink = Math.floor(game.deadTick / 20) % 2 === 0;
+    if (blink) pixelText('ENTER para voltar ao menu', 240, 450, 11, C.ui, 'center');
+  }
+}
+
+function drawWin() {
+  // Starfield shimmer
+  ctx.fillStyle = 'rgba(5,6,15,0.6)';
+  ctx.fillRect(0, 0, 480, 720);
+
+  for (let i = 0; i < 200; i++) {
+    const a = (game.starTick * 0.5 + i * 37.3) % (Math.PI * 2);
+    ctx.fillStyle = C.balls[i % C.balls.length] + '88';
+    ctx.fillRect(
+      (160 + Math.cos(a + i) * 40 + i * 3.14) % 480,
+      (200 + Math.sin(a + i) * 40 + i * 2.71) % 720,
+      2, 2
+    );
+  }
+
+  pixelText('o céu está vazio.', 240, 280, 16, '#ffffff', 'center');
+  pixelText('"As esferas não foram destruídas.', 240, 330, 12, C.ui, 'center');
+  pixelText('Apenas encontraram alguém', 240, 350, 12, C.ui, 'center');
+  pixelText('capaz de suportá-las."', 240, 370, 12, C.ui, 'center');
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(231, 420, 18, 18);
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(236, 425, 3, 3);
+  ctx.fillRect(241, 425, 3, 3);
+
+  if (game.infinitePlusUnlocked) {
+    pixelText('INFINITO+ DESBLOQUEADO', 240, 480, 12, C.balls[0], 'center');
+  }
+
+  const blink = Math.floor(game.starTick / 25) % 2 === 0;
+  if (blink) pixelText('ENTER para continuar', 240, 530, 11, C.ui, 'center');
+}
+
+function drawCredits() {
+  ctx.fillStyle = 'rgba(5,6,15,0.9)';
+  ctx.fillRect(0, 0, 480, 720);
+
+  pixelText('CRÉDITOS', 240, 200, 18, '#ffffff', 'center');
+
+  const lines = [
+    ['DESIGNER', 'um quadrado'],
+    ['MÚSICA', 'silêncio confortável'],
+    ['INIMIGOS', 'as bolinhas'],
+    ['ROTEIRO', 'nenhum'],
+    ['CAFÉ', 'sim'],
+    ['BUGS', 'features'],
+  ];
+  for (let i = 0; i < lines.length; i++) {
+    pixelText(lines[i][0], 160, 270 + i * 36, 10, C.ui, 'right');
+    pixelText(lines[i][1], 168, 270 + i * 36, 10, '#ffffff', 'left');
+  }
+
+  const blink = Math.floor(game.starTick / 25) % 2 === 0;
+  if (blink) pixelText('ENTER para voltar', 240, 520, 11, C.textDim, 'center');
+}
+
+// ─── LOOP ─────────────────────────────────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
